@@ -194,6 +194,14 @@ class WXBotConfig:
         self.reply_delay_min    = 1     # 最小延迟秒数
         self.reply_delay_max    = 5     # 最大延迟秒数
 
+        # ---------- 私聊连续消息合并回复 ----------
+        self.chat_merge_reply_switch = True
+        self.chat_merge_wait_seconds = 6
+        self.chat_merge_max_wait_seconds = 18
+        self.chat_merge_max_messages = 5
+        self.chat_merge_delay_min = 1
+        self.chat_merge_delay_max = 3
+
         # 初始化时自动加载配置并同步到属性
         self.load_config()
         self.update_global_config()
@@ -279,6 +287,12 @@ class WXBotConfig:
                     "reply_delay_switch": True,
                     "reply_delay_min": 1,
                     "reply_delay_max": 5,
+                    "chat_merge_reply_switch": True,
+                    "chat_merge_wait_seconds": 6,
+                    "chat_merge_max_wait_seconds": 18,
+                    "chat_merge_max_messages": 5,
+                    "chat_merge_delay_min": 1,
+                    "chat_merge_delay_max": 3,
                     "chat_image_recognition_switch": False,
                     "chat_image_recognition_api": 0,
                     "group_image_recognition_switch": False,
@@ -505,6 +519,33 @@ class WXBotConfig:
         self.reply_delay_min    = max(1, int(self.config.get('reply_delay_min', 1)))
         self.reply_delay_max    = max(1, int(self.config.get('reply_delay_max', 5)))
 
+        _merge_defaults = {
+            'chat_merge_reply_switch': True,
+            'chat_merge_wait_seconds': 6,
+            'chat_merge_max_wait_seconds': 18,
+            'chat_merge_max_messages': 5,
+            'chat_merge_delay_min': 1,
+            'chat_merge_delay_max': 3,
+        }
+        _merge_needs_save = any(k not in self.config for k in _merge_defaults)
+        for k, v in _merge_defaults.items():
+            self.config.setdefault(k, v)
+        if _merge_needs_save:
+            self.save_config()
+            log(message="已自动补充私聊合并回复配置默认值并写回配置文件")
+        self.chat_merge_reply_switch = bool(self.config.get('chat_merge_reply_switch', True))
+        self.chat_merge_wait_seconds = max(1, int(self.config.get('chat_merge_wait_seconds', 6)))
+        self.chat_merge_max_wait_seconds = max(
+            self.chat_merge_wait_seconds,
+            int(self.config.get('chat_merge_max_wait_seconds', 18))
+        )
+        self.chat_merge_max_messages = max(1, int(self.config.get('chat_merge_max_messages', 5)))
+        self.chat_merge_delay_min = max(0, int(self.config.get('chat_merge_delay_min', 1)))
+        self.chat_merge_delay_max = max(
+            self.chat_merge_delay_min,
+            int(self.config.get('chat_merge_delay_max', 3))
+        )
+
         # 图片识别配置
         self.chat_image_recognition_switch  = bool(self.config.get('chat_image_recognition_switch', False))
         self.chat_image_recognition_api     = int(self.config.get('chat_image_recognition_api', 0))
@@ -612,12 +653,18 @@ class WXBotConfig:
         """将超长文本按指定长度切分为列表，用于分段发送"""
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-    def human_delay(self):
+    def human_delay(self, delay_min=None, delay_max=None, enabled=None):
         """模拟人工操作随机延迟。reply_delay_switch 关闭时直接跳过。"""
-        if not self.reply_delay_switch:
+        if delay_min is None:
+            delay_min = self.reply_delay_min
+        if delay_max is None:
+            delay_max = self.reply_delay_max
+        if enabled is None:
+            enabled = self.reply_delay_switch
+        if not enabled:
             return
-        lo = min(self.reply_delay_min, self.reply_delay_max)
-        hi = max(self.reply_delay_min, self.reply_delay_max)
+        lo = min(delay_min, delay_max)
+        hi = max(delay_min, delay_max)
         time.sleep(random.randint(lo, hi))
 
     @staticmethod
@@ -1547,6 +1594,9 @@ class WXBot:
         self.msg_replied_count   = 0            # 已回复消息数
         self.last_msg_time       = None         # 最近一条消息的时间字符串
         self.last_msg_sender     = None         # 最近一条消息的发送者
+        self._private_reply_batches = {}        # chat_name -> buffered private messages
+        self._private_reply_batch_lock = threading.Lock()
+        self._private_reply_batch_seq = 0
 
     def _init_api(self):
         """根据配置中的 api_sdk 字段实例化对应的 AI 接口对象（默认接口）"""
@@ -2516,6 +2566,9 @@ class WXBot:
         if (self.config.AllListen_switch and chat.who in self.config.listen_list) or\
             (self.config.AllListen_switch and chat.chat_type == 'group'):
             return result
+        if self._should_batch_private_message(chat, message):
+            return self._enqueue_private_batch(chat, message)
+        self._flush_private_batch(chat.who, reason="non_batch_message")
         # 私聊AI接口回复
         result = self.wx_send_ai(chat, message)
         return result
@@ -2559,6 +2612,189 @@ class WXBot:
         """按 ||SPLIT|| 分隔符解析回复，过滤空白，截断到 max_count 条"""
         parts = [p.strip() for p in reply.split(SPLIT_SEPARATOR) if p.strip()]
         return parts[:max_count] if parts else [reply]
+
+    def _should_batch_private_message(self, chat, message):
+        """判断当前私聊消息是否应进入连续消息合并缓冲。"""
+        if not self.config.chat_merge_reply_switch:
+            return False
+        if self._pause_chat_reply:
+            return False
+        if getattr(chat, 'chat_type', '') == 'group':
+            return False
+        content = str(getattr(message, 'content', '') or '').strip()
+        if not content:
+            return False
+        if getattr(message, 'type', '') == 'image':
+            return False
+        if '+引用的图片:' in content:
+            return False
+        if self.config.chat_keyword_switch:
+            for keyword in self.config.keyword_dict:
+                if keyword and keyword in content:
+                    return False
+        return True
+
+    def _enqueue_private_batch(self, chat, message):
+        """将私聊消息放入缓冲区，并按静默时间或阈值决定是否立即 flush。"""
+        now_ts = time.time()
+        timer_to_start = None
+        flush_now = False
+        flush_reason = "timer"
+        pending_count = 0
+        wait_seconds = self.config.chat_merge_wait_seconds
+
+        with self._private_reply_batch_lock:
+            entry = self._private_reply_batches.get(chat.who)
+            if entry is None:
+                entry = {
+                    'items': [],
+                    'first_ts': now_ts,
+                    'last_ts': now_ts,
+                    'timer': None,
+                    'version': 0,
+                }
+                self._private_reply_batches[chat.who] = entry
+
+            entry['items'].append({
+                'content': str(message.content),
+                'sender': str(message.sender),
+                'type': str(getattr(message, 'type', '')),
+                'received_at': datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+            })
+            if len(entry['items']) == 1:
+                entry['first_ts'] = now_ts
+            entry['last_ts'] = now_ts
+
+            old_timer = entry.get('timer')
+            if old_timer:
+                old_timer.cancel()
+
+            self._private_reply_batch_seq += 1
+            entry['version'] = self._private_reply_batch_seq
+            pending_count = len(entry['items'])
+            elapsed = now_ts - entry['first_ts']
+
+            if pending_count >= self.config.chat_merge_max_messages:
+                entry['timer'] = None
+                flush_now = True
+                flush_reason = "max_messages"
+            elif elapsed >= self.config.chat_merge_max_wait_seconds:
+                entry['timer'] = None
+                flush_now = True
+                flush_reason = "max_wait"
+            else:
+                remaining = max(0, self.config.chat_merge_max_wait_seconds - elapsed)
+                wait_seconds = min(self.config.chat_merge_wait_seconds, remaining)
+                if wait_seconds <= 0:
+                    entry['timer'] = None
+                    flush_now = True
+                    flush_reason = "max_wait"
+                else:
+                    timer_to_start = threading.Timer(
+                        wait_seconds,
+                        self._flush_private_batch,
+                        args=(chat.who, "silence_timeout", entry['version'])
+                    )
+                    timer_to_start.daemon = True
+                    entry['timer'] = timer_to_start
+
+        if timer_to_start:
+            timer_to_start.start()
+            log(message=f"私聊 {chat.who} 已缓冲 {pending_count} 条消息，{int(wait_seconds)} 秒静默后合并回复")
+            return True
+
+        if flush_now:
+            log(message=f"私聊 {chat.who} 触发合并回复，原因：{flush_reason}，共 {pending_count} 条消息")
+            return self._flush_private_batch(chat.who, flush_reason)
+
+        return True
+
+    def _flush_private_batch(self, chat_name, reason="manual", expected_version=None):
+        """将指定私聊缓冲中的消息合并后调用 AI 回复。"""
+        with self._private_reply_batch_lock:
+            entry = self._private_reply_batches.get(chat_name)
+            if not entry:
+                return True
+            if expected_version is not None and entry.get('version') != expected_version:
+                return True
+
+            timer = entry.get('timer')
+            if timer and threading.current_thread() is not timer:
+                timer.cancel()
+
+            batch_items = list(entry.get('items', []))
+            self._private_reply_batches.pop(chat_name, None)
+
+        if not batch_items:
+            return True
+        if self._pause_chat_reply:
+            log(message=f"私聊 {chat_name} 合并批次因已暂停自动回复而丢弃，共 {len(batch_items)} 条")
+            return True
+        if not self.run_flag or self.wx is None:
+            return True
+
+        try:
+            chat = self.wx.GetSubWindow(nickname=chat_name)
+        except Exception as e:
+            log(level="ERROR", message=f"获取私聊窗口失败，无法发送合并回复：{chat_name} - {e}")
+            return False
+
+        history = None
+        if self.config.memory_switch and self.memory_manager:
+            history = self.memory_manager.get_messages(chat_name, self.config.memory_context_count)
+            history = self._trim_batched_history_tail(history, batch_items)
+
+        merged_message = type('MergedMessage', (), {})()
+        merged_message.content = self._build_batched_private_input(chat_name, batch_items)
+        merged_message.type = 'text'
+        merged_message.sender = batch_items[-1].get('sender', chat_name)
+        merged_message.attr = 'friend'
+
+        log(message=f"私聊 {chat_name} 开始发送合并回复，原因：{reason}，共 {len(batch_items)} 条消息")
+        return self.wx_send_ai(
+            chat,
+            merged_message,
+            history_override=history,
+            delay_override=(self.config.chat_merge_delay_min, self.config.chat_merge_delay_max),
+            skip_keyword=True,
+        )
+
+    def _build_batched_private_input(self, chat_name, batch_items):
+        """将同一私聊窗口短时间内的多条消息合并成一次 AI 输入。"""
+        lines = [
+            "同一用户短时间连续发送了以下几条消息，请合并理解并给出一条自然、聚焦的回复。",
+            "不要逐条机械分别作答，也不要重复用户原话。",
+            f"会话：{chat_name}",
+            "消息列表：",
+        ]
+        for idx, item in enumerate(batch_items, start=1):
+            lines.append(f"{idx}. {item.get('content', '').strip()}")
+        return "\n".join(lines)
+
+    def _trim_batched_history_tail(self, history, batch_items):
+        """从历史尾部移除本次已合并的用户消息，避免重复喂给 AI。"""
+        if not history or not batch_items:
+            return history
+
+        trimmed = list(history)
+        max_match = min(len(trimmed), len(batch_items))
+        for match_count in range(max_match, 0, -1):
+            history_slice = trimmed[-match_count:]
+            batch_slice = batch_items[:match_count]
+            matched = True
+            for history_item, batch_item in zip(history_slice, batch_slice):
+                if history_item.get('attr') == 'self':
+                    matched = False
+                    break
+                if str(history_item.get('content', '')) != str(batch_item.get('content', '')):
+                    matched = False
+                    break
+                if str(history_item.get('sender', '')) != str(batch_item.get('sender', '')):
+                    matched = False
+                    break
+            if matched:
+                return trimmed[:-match_count]
+        return history
 
     def _is_custom_forward_source(self, chat_who):
         """判断某个会话是否是任意自定义转发规则的监听来源"""
@@ -2606,7 +2842,8 @@ class WXBot:
                             message.forward(target)
                         log(message=f"[自定义转发] {chat.who} → {target}（规则类型：{rule_type}，附带来源：{forward_with_source}）")
 
-    def wx_send_ai(self, chat, message):
+    def wx_send_ai(self, chat, message, message_override=None, history_override=None,
+                   delay_override=None, skip_keyword=False):
         """
         对私聊消息调用 AI 接口并发送回复。
         支持关键词优先匹配，超过 2000 字时自动分段发送。
@@ -2619,19 +2856,23 @@ class WXBot:
         # log(level="DEBUG", message=f"[DEBUG] 私聊暂停标志：{self._pause_chat_reply}，来源：{chat.who}")
         if self._pause_chat_reply:
             return True
+        message_content = message_override if message_override is not None else str(message.content)
         try:
             is_keyword = False
             # 私聊关键词优先匹配
-            if self.config.chat_keyword_switch:
+            if self.config.chat_keyword_switch and not skip_keyword:
                 for keyword in self.config.keyword_dict:
-                    if keyword in message.content:
+                    if keyword in message_content:
                         is_keyword = True
-                        log(message=f"私聊 {chat.who} 关键字消息：" + message.content)
+                        log(message=f"私聊 {chat.who} 关键字消息：" + message_content)
                         reply = self.config.keyword_dict[keyword]
             if not is_keyword:
                 # 未命中关键词，调用 AI 接口（带入历史记忆）
-                history = []
-                if self.config.memory_switch and self.memory_manager:
+                if history_override is not None:
+                    history = history_override
+                else:
+                    history = []
+                if history_override is None and self.config.memory_switch and self.memory_manager:
                     history = self.memory_manager.get_messages(
                         chat.who, self.config.memory_context_count
                     )
@@ -2655,9 +2896,9 @@ class WXBot:
                             history=history,
                             image_path=message.content
                         )
-                    elif '+引用的图片:' in message.content:
+                    elif '+引用的图片:' in message_content:
                         # 引用图片消息：拆分文字部分和图片路径
-                        text_part, img_path = message.content.split('+引用的图片:', 1)
+                        text_part, img_path = message_content.split('+引用的图片:', 1)
                         rec_api = self._init_api_by_index(self.config.chat_image_recognition_api)
                         reply = rec_api.chat(
                             text_part.strip() or "请简短描述这张图片的内容",
@@ -2667,12 +2908,12 @@ class WXBot:
                         )
                     else:
                         # 普通文字消息：使用用户专属接口和 prompt
-                        reply = self._get_chat_api(chat.who).chat(message.content, prompt=_effective_prompt, history=history)
+                        reply = self._get_chat_api(chat.who).chat(message_content, prompt=_effective_prompt, history=history)
                 else:
                     # 识别关闭：图片消息静默跳过，文字消息正常
-                    # if message.type == 'image' or '+引用的图片:' in message.content:
+                    # if message.type == 'image' or '+引用的图片:' in message_content:
                         # return True
-                    reply = self._get_chat_api(chat.who).chat(message.content, prompt=_effective_prompt, history=history)
+                    reply = self._get_chat_api(chat.who).chat(message_content, prompt=_effective_prompt, history=history)
         except Exception as e:
             print(traceback.format_exc())
             log(level="ERROR", message=str(e) + "\nAPI返回错误，请稍后再试")
@@ -2689,7 +2930,10 @@ class WXBot:
             parts = [reply]
 
         for part in parts:
-            self.config.human_delay()   # 每条发送前都延迟（含第一条，与原逻辑等效）
+            if delay_override is None:
+                self.config.human_delay()   # 每条发送前都延迟（含第一条，与原逻辑等效）
+            else:
+                self.config.human_delay(delay_override[0], delay_override[1], enabled=True)
             if len(part) >= 2000:
                 for segment in self.config.split_long_text(part):
                     result = chat.SendMsg(segment)
@@ -3777,6 +4021,13 @@ class WXBot:
         """安全停止机器人：停止 wxautox 监听并退出主循环"""
         try:
             self.run_flag = False
+            with self._private_reply_batch_lock:
+                pending_batches = list(self._private_reply_batches.values())
+                self._private_reply_batches.clear()
+            for entry in pending_batches:
+                timer = entry.get('timer')
+                if timer:
+                    timer.cancel()
             self.wx.StopListening()
             log(level="WARNING", message='siver_wxbot安全退出！！')
             return True

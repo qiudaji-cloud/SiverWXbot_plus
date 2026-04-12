@@ -10,6 +10,8 @@
 
 📖 **[查看完整使用文档](https://wxbot.siverking.online)**
 
+📌 **本地定制升级记录**：[`docs/local_custom_upgrade.md`](docs/local_custom_upgrade.md)
+
 ---
 
 ## 📦 安装部署
