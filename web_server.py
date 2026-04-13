@@ -7,6 +7,7 @@
 使用 Flask 框架开发，提供机器人控制、配置管理等功能
 """
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+import hashlib
 import json
 import os
 import shutil
@@ -60,6 +61,8 @@ ADMIN_FILE  = os.path.join(base_dir(), 'config', 'admin.json')
 EMAIL_FILE  = os.path.join(base_dir(), 'config', 'email.txt')
 PROMPT_DIR  = os.path.join(base_dir(), 'config', 'prompt')
 BACKUP_BASE = os.path.join(base_dir(), 'old_wxbot_config')
+MEMORY_BASE = os.path.join(base_dir(), 'memory')
+MEMORY_V2_BASE = os.path.join(base_dir(), 'memory_v2')
 DEFAULT_PROMPT_CONTENT = "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内"
 
 # 启动时确保目录存在
@@ -189,7 +192,7 @@ def _migrate_prompt_from_config(config):
 def _do_backup():
     """
     执行一次完整数据备份：
-      - 将 config/ 和 memory/ 复制到 old_wxbot_config/<时间戳>/
+      - 将 config/、memory/、memory_v2/ 复制到 old_wxbot_config/<时间戳>/
       - 在时间戳目录内创建以当前版本号命名的空标记文件（如 V4.6.10）
     返回备份目录的绝对路径。
     """
@@ -199,11 +202,14 @@ def _do_backup():
 
     config_src = os.path.join(base_dir(), 'config')
     memory_src = os.path.join(base_dir(), 'memory')
+    memory_v2_src = os.path.join(base_dir(), 'memory_v2')
 
     if os.path.exists(config_src):
         shutil.copytree(config_src, os.path.join(backup_dir, 'config'))
     if os.path.exists(memory_src):
         shutil.copytree(memory_src, os.path.join(backup_dir, 'memory'))
+    if os.path.exists(memory_v2_src):
+        shutil.copytree(memory_v2_src, os.path.join(backup_dir, 'memory_v2'))
 
     # 创建版本号标记文件（空文件，文件名即版本号）
     version_marker = os.path.join(backup_dir, BOT_VERSION)
@@ -225,7 +231,8 @@ def _check_and_auto_backup():
     """
     config_src = os.path.join(base_dir(), 'config')
     memory_src = os.path.join(base_dir(), 'memory')
-    has_data = os.path.exists(config_src) or os.path.exists(memory_src)
+    memory_v2_src = os.path.join(base_dir(), 'memory_v2')
+    has_data = os.path.exists(config_src) or os.path.exists(memory_src) or os.path.exists(memory_v2_src)
     if not has_data:
         return  # 没有任何数据，无需备份
 
@@ -414,6 +421,10 @@ def dashboard():
     config.setdefault('memory_switch', True)
     config.setdefault('memory_max_count', 3000)
     config.setdefault('memory_context_count', 1000)
+    config.setdefault('private_profile_memory_switch', False)
+    config.setdefault('memory_agent_api_index', -1)
+    config.setdefault('memory_recent_turns', 8)
+    config.setdefault('memory_summary_budget_chars', 6000)
     config.setdefault('reply_delay_switch', True)
     config.setdefault('reply_delay_min', 1)
     config.setdefault('reply_delay_max', 5)
@@ -477,6 +488,7 @@ def _coerce_bool_fields(merged_config):
         'random_moments_switch',            # 随机定时朋友圈开关
         'everyday_start_stop_bot_switch',   # 新增
         'memory_switch',                    # 记忆开关
+        'private_profile_memory_switch',    # 私聊对象档案记忆 V2
         'reply_delay_switch',               # 发送延迟开关
         'chat_image_recognition_switch',    # 私聊图片识别开关
         'group_image_recognition_switch',   # 群组图片识别开关
@@ -520,6 +532,8 @@ def _coerce_int_range_fields(merged_config):
     int_range_fields = {
         'new_friend_check_min': (60, 3600, 60),
         'new_friend_check_max': (60, 3600, 300),
+        'memory_recent_turns': (2, 30, 8),
+        'memory_summary_budget_chars': (500, 20000, 6000),
     }
     for field, (lo, hi, default) in int_range_fields.items():
         if field in merged_config:
@@ -532,6 +546,19 @@ def _coerce_int_range_fields(merged_config):
     if 'new_friend_check_min' in merged_config and 'new_friend_check_max' in merged_config:
         if merged_config['new_friend_check_min'] > merged_config['new_friend_check_max']:
             merged_config['new_friend_check_max'] = merged_config['new_friend_check_min']
+    if 'memory_agent_api_index' in merged_config:
+        try:
+            idx = int(merged_config['memory_agent_api_index'])
+        except (TypeError, ValueError):
+            idx = -1
+        api_total = len(merged_config.get('api_configs', []))
+        if idx < -1:
+            idx = -1
+        if api_total <= 0:
+            idx = -1
+        elif idx >= api_total:
+            idx = api_total - 1
+        merged_config['memory_agent_api_index'] = idx
 
 def _coerce_dict_fields(merged_config):
     # keyword_dict 支持：dict / JSON字符串 / list[{key, value}]
@@ -670,6 +697,7 @@ def save_config_route():
         _coerce_bool_fields(merged_config)
         _coerce_list_fields(merged_config)
         _coerce_float_fields(merged_config)
+        _coerce_int_range_fields(merged_config)
         _coerce_dict_fields(merged_config)
 
         if save_config(merged_config):
@@ -1015,8 +1043,6 @@ def pick_image_file():
         log('ERROR', f'文件选择框出错: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
-MEMORY_BASE = os.path.join(base_dir(), 'memory')
-
 @app.route('/api/backup_now', methods=['POST'])
 @login_required
 def backup_now():
@@ -1053,6 +1079,16 @@ def _safe_is_dir(parent_abs, name):
         return _stat.S_ISDIR(os.stat(p).st_mode)
     except OSError:
         return False
+
+
+def _memory_v2_private_dir(wx_id, chat_name):
+    entity_hash = hashlib.sha1(f"private::{chat_name}".encode("utf-8")).hexdigest()
+    return os.path.join(MEMORY_V2_BASE, wx_id, "private", entity_hash)
+
+
+def _remove_tree_if_exists(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
 
 @app.route('/memory/chats/<wx_id>')
@@ -1102,10 +1138,12 @@ def memory_delete_wx(wx_id):
     try:
         if os.name == 'nt':
             wx_path = '\\\\?\\' + os.path.abspath(os.path.join(MEMORY_BASE, wx_id))
+            wx_v2_path = '\\\\?\\' + os.path.abspath(os.path.join(MEMORY_V2_BASE, wx_id))
         else:
             wx_path = os.path.join(MEMORY_BASE, wx_id)
-        if os.path.exists(wx_path):
-            shutil.rmtree(wx_path)
+            wx_v2_path = os.path.join(MEMORY_V2_BASE, wx_id)
+        _remove_tree_if_exists(wx_path)
+        _remove_tree_if_exists(wx_v2_path)
         log('SUCCESS', f'已删除微信号 {wx_id} 的所有记忆')
         return jsonify({'status': 'success', 'message': '已删除'})
     except Exception as e:
@@ -1121,8 +1159,8 @@ def memory_delete_chat(wx_id, chat_name):
             chat_path = '\\\\?\\' + parent_abs + '\\' + chat_name
         else:
             chat_path = os.path.join(parent_abs, chat_name)
-        if os.path.exists(chat_path):
-            shutil.rmtree(chat_path)
+        _remove_tree_if_exists(chat_path)
+        _remove_tree_if_exists(_memory_v2_private_dir(wx_id, chat_name))
         log('SUCCESS', f'已删除 {wx_id}/{chat_name} 的记忆')
         return jsonify({'status': 'success', 'message': '已删除'})
     except Exception as e:
@@ -1282,6 +1320,10 @@ def main():
                 "memory_switch": True,
                 "memory_max_count": 3000,
                 "memory_context_count": 1000,
+                "private_profile_memory_switch": False,
+                "memory_agent_api_index": -1,
+                "memory_recent_turns": 8,
+                "memory_summary_budget_chars": 6000,
                 "reply_delay_switch": True,
                 "reply_delay_min": 1,
                 "reply_delay_max": 5,

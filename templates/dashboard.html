@@ -1581,6 +1581,39 @@ body { background: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "S
           <div class="cfg-hint">AI 回复时从记忆中读取最近 N 条作为上下文传入</div>
         </div>
       </div>
+      <hr style="margin:20px 0;border:none;border-top:1px solid var(--border);">
+      <div class="switch-row">
+        <input class="form-check-input" type="checkbox" id="private_profile_memory_switch" {% if config.get('private_profile_memory_switch', False) %}checked{% endif %}>
+        <label class="form-check-label" for="private_profile_memory_switch">启用私聊对象档案记忆 V2</label>
+        <span class="switch-desc">仅作用于私聊文本消息，自动做意图抽取、Patch 更新和滚动摘要，群聊不受影响</span>
+      </div>
+      <div class="cfg-hint" style="margin-bottom:16px;">V2 会把私聊对象的长期偏好、沟通风格、情绪触发器和滚动摘要拆开保存到 <code>memory_v2/</code>，普通 Prompt 管理页不会显示内部 Prompt。</div>
+      <div class="row g-3">
+        <div class="col-12 col-md-6">
+          <label class="cfg-label" for="memory_agent_api_index">V2 内部链路接口</label>
+          <select class="form-select" id="memory_agent_api_index">
+            <option value="-1" {% if config.get('memory_agent_api_index', -1) == -1 %}selected{% endif %}>跟随当前私聊接口</option>
+            {% for cfg in config.get('api_configs', []) %}
+            <option value="{{ loop.index0 }}" {% if config.get('memory_agent_api_index', -1) == loop.index0 %}selected{% endif %}>
+              接口 {{ loop.index }} · {{ cfg.get('model', '') }}
+            </option>
+            {% endfor %}
+          </select>
+          <div class="cfg-hint">意图抽取、Patch、摘要默认跟随私聊回复接口，也可以单独指定到更稳定的模型。</div>
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="cfg-label" for="memory_recent_turns">最近原始轮次</label>
+          <input type="number" class="form-control" id="memory_recent_turns" min="2" max="30"
+            value="{{ config.get('memory_recent_turns', 8) }}" placeholder="8">
+          <div class="cfg-hint">回复层注入最近 N 轮原始私聊</div>
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="cfg-label" for="memory_summary_budget_chars">摘要触发阈值（字）</label>
+          <input type="number" class="form-control" id="memory_summary_budget_chars" min="500" max="20000"
+            value="{{ config.get('memory_summary_budget_chars', 6000) }}" placeholder="6000">
+          <div class="cfg-hint">达到阈值后触发滚动摘要压缩</div>
+        </div>
+      </div>
     </div>
     <!-- 记忆查看卡片 -->
     <div class="cfg-card">
@@ -2624,6 +2657,10 @@ $(function(){
       memory_switch:$('#memory_switch').is(':checked'),
       memory_max_count:parseInt($('#memory_max_count').val())||3000,
       memory_context_count:parseInt($('#memory_context_count').val())||1000,
+      private_profile_memory_switch:$('#private_profile_memory_switch').is(':checked'),
+      memory_agent_api_index:parseInt($('#memory_agent_api_index').val()),
+      memory_recent_turns:Math.max(2,Math.min(30,parseInt($('#memory_recent_turns').val())||8)),
+      memory_summary_budget_chars:Math.max(500,Math.min(20000,parseInt($('#memory_summary_budget_chars').val())||6000)),
       reply_delay_switch:$('#reply_delay_switch').is(':checked'),
       reply_delay_min:Math.max(1,parseInt($('#reply_delay_min').val())||1),
       reply_delay_max:Math.max(1,parseInt($('#reply_delay_max').val())||5),

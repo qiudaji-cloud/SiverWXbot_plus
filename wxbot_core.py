@@ -55,6 +55,7 @@ is_wxautox = True  # 标识当前使用的是 wxautox Plus 版本
 # ============================================================
 import email_send
 from logger import log
+from private_memory_engine import DEFAULT_INTERNAL_PROMPTS, PrivateMemoryEngine
 
 # ============================================================
 # wxautox 全局参数配置
@@ -113,6 +114,7 @@ class WXBotConfig:
         _base = os.path.dirname(sys.executable) if hasattr(sys, '_MEIPASS') else os.path.abspath(".")
         self.CONFIG_FILE = os.path.join(_base, 'config', 'config.json')
         self.prompt_dir  = os.path.join(_base, 'config', 'prompt')
+        self.prompt_internal_dir = os.path.join(_base, 'config', 'prompt_internal')
         os.makedirs(os.path.join(_base, 'config'), exist_ok=True)
         self.config = {}
 
@@ -188,6 +190,10 @@ class WXBotConfig:
         self.memory_switch        = True      # 记忆开关（默认开启）
         self.memory_max_count     = 3000     # 单窗口最多存储条数（上限 5000）
         self.memory_context_count = 1000     # AI 请求时带入条数
+        self.private_profile_memory_switch = False
+        self.memory_agent_api_index = -1
+        self.memory_recent_turns = 8
+        self.memory_summary_budget_chars = 6000
 
         # ---------- 发送延迟配置 ----------
         self.reply_delay_switch = True  # 模拟人工操作延迟开关（默认开启）
@@ -284,6 +290,10 @@ class WXBotConfig:
                     "memory_switch": True,
                     "memory_max_count": 3000,
                     "memory_context_count": 1000,
+                    "private_profile_memory_switch": False,
+                    "memory_agent_api_index": -1,
+                    "memory_recent_turns": 8,
+                    "memory_summary_budget_chars": 6000,
                     "reply_delay_switch": True,
                     "reply_delay_min": 1,
                     "reply_delay_max": 5,
@@ -352,6 +362,19 @@ class WXBotConfig:
             except Exception as e:
                 log(level="ERROR", message=f"创建默认 prompt 文件失败: {e}")
 
+    def init_prompt_internal_dir(self):
+        """确保内部 Prompt 目录存在，并补齐程序运行所需的默认内部 Prompt。"""
+        os.makedirs(self.prompt_internal_dir, exist_ok=True)
+        for name, content in DEFAULT_INTERNAL_PROMPTS.items():
+            target = os.path.join(self.prompt_internal_dir, f"{name}.md")
+            if os.path.exists(target):
+                continue
+            try:
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                log(level="ERROR", message=f"创建内部 prompt 文件失败 {name}: {e}")
+
     def get_prompt_content(self, name):
         """按名称读取 prompt 文件内容，找不到时 fallback 到 default_prompt，最终返回空字符串"""
         if not name:
@@ -373,6 +396,19 @@ class WXBotConfig:
                 except Exception:
                     pass
         return ""
+
+    def get_internal_prompt_content(self, name):
+        """按名称读取内部 Prompt，缺失时回退到内置默认值。"""
+        if not name:
+            return ""
+        path = os.path.join(self.prompt_internal_dir, f"{name}.md")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                pass
+        return DEFAULT_INTERNAL_PROMPTS.get(name, "")
 
     # ----------------------------------------------------------
     # 配置同步：将 config 字典中的值同步到实例属性
@@ -506,6 +542,22 @@ class WXBotConfig:
         self.memory_switch        = self.config.get('memory_switch', True)
         self.memory_max_count     = int(self.config.get('memory_max_count', 3000))
         self.memory_context_count = int(self.config.get('memory_context_count', 1000))
+        _memory_v2_defaults = {
+            'private_profile_memory_switch': False,
+            'memory_agent_api_index': -1,
+            'memory_recent_turns': 8,
+            'memory_summary_budget_chars': 6000,
+        }
+        _memory_v2_needs_save = any(k not in self.config for k in _memory_v2_defaults)
+        for k, v in _memory_v2_defaults.items():
+            self.config.setdefault(k, v)
+        if _memory_v2_needs_save:
+            self.save_config()
+            log(message="已自动补充私聊对象档案记忆配置默认值并写回配置文件")
+        self.private_profile_memory_switch = bool(self.config.get('private_profile_memory_switch', False))
+        self.memory_agent_api_index = int(self.config.get('memory_agent_api_index', -1))
+        self.memory_recent_turns = max(2, int(self.config.get('memory_recent_turns', 8)))
+        self.memory_summary_budget_chars = max(500, int(self.config.get('memory_summary_budget_chars', 6000)))
 
         # 发送延迟配置（若旧配置文件中不存在则自动补写默认值）
         _delay_defaults = {'reply_delay_switch': True, 'reply_delay_min': 1, 'reply_delay_max': 5}
@@ -562,6 +614,7 @@ class WXBotConfig:
         self.chat_api_map     = self.config.get('chat_api_map', {})
         self.group_prompt_map = self.config.get('group_prompt_map', {})
         self.init_prompt_dir()
+        self.init_prompt_internal_dir()
 
         # 接口调用失败时的固定回复
         self.api_error_reply = self.config.get('api_error_reply', '在忙，我稍后回复您')
@@ -777,6 +830,15 @@ class MemoryManager:
 # AI 接口类
 # ============================================================
 
+def format_ai_history_content(history_item, include_assistant_name=False, assistant_name="助手", fallback_user_name="用户"):
+    """格式化发送给 AI 的历史消息内容，不向模型暴露时间戳。"""
+    raw = history_item.get('content', '')
+    if history_item.get('attr') == 'self':
+        return f"{assistant_name}: {raw}" if include_assistant_name else raw
+    sender = history_item.get('sender', '') or fallback_user_name
+    return f"{sender}: {raw}" if sender else raw
+
+
 class OpenAIAPI:
     """
     OpenAI 兼容接口封装类
@@ -818,13 +880,7 @@ class OpenAIAPI:
         if history:
             for h in history:
                 role = "assistant" if h.get('attr') == 'self' else "user"
-                t = h.get('time', '')
-                raw = h.get('content', '')
-                sender = h.get('sender', '')
-                if role == 'user' and sender:
-                    content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
-                else:
-                    content = f"[{t}] {raw}" if t else raw
+                content = format_ai_history_content(h)
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
 
@@ -957,7 +1013,7 @@ class DifyAPI:
         query = message
         if history:
             ctx = "\n".join([
-                f"[{h.get('time', '')}] {'助手' if h.get('attr') == 'self' else h.get('sender', '用户')}: {h.get('content', '')}"
+                format_ai_history_content(h, include_assistant_name=True)
                 for h in history
             ])
             query = f"[历史对话]\n{ctx}\n[当前消息]\n{message}"
@@ -1095,20 +1151,14 @@ class CozeAPI:
         additional_messages = []
         if history:
             for h in history:
-                t = h.get('time', '')
-                raw = h.get('content', '')
-                sender = h.get('sender', '')
                 if h.get('attr') == 'self':
-                    content = f"[{t}] {raw}" if t else raw
+                    content = format_ai_history_content(h)
                     try:
                         additional_messages.append(CozeMessage.build_assistant_answer(content))
                     except Exception:
                         additional_messages.append(CozeMessage.build_user_question_text(f"[助手]: {content}"))
                 else:
-                    if sender:
-                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
-                    else:
-                        content = f"[{t}] {raw}" if t else raw
+                    content = format_ai_history_content(h)
                     additional_messages.append(CozeMessage.build_user_question_text(content))
         additional_messages.append(CozeMessage.build_user_question_text(message))
         chunk_message = ""
@@ -1373,13 +1423,7 @@ class DusAPI:
             if history:
                 for h in history:
                     role = "assistant" if h.get('attr') == 'self' else "user"
-                    t = h.get('time', '')
-                    raw = h.get('content', '')
-                    sender = h.get('sender', '')
-                    if role == 'user' and sender:
-                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
-                    else:
-                        content = f"[{t}] {raw}" if t else raw
+                    content = format_ai_history_content(h)
                     messages.append({"role": role, "content": content})
             messages.append({"role": "user", "content": user_content})
 
@@ -1465,13 +1509,7 @@ class DusAPI:
             if history:
                 for h in history:
                     role = "assistant" if h.get('attr') == 'self' else "user"
-                    t = h.get('time', '')
-                    raw = h.get('content', '')
-                    sender = h.get('sender', '')
-                    if role == 'user' and sender:
-                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
-                    else:
-                        content = f"[{t}] {raw}" if t else raw
+                    content = format_ai_history_content(h)
                     input_items.append({
                         "role": role,
                         "content": content
@@ -1584,6 +1622,7 @@ class WXBot:
         self._pause_chat_reply        = False  # 暂停私聊 AI 自动回复标志
         self._pause_group_reply       = False  # 暂停群聊 AI 自动回复标志
         self.memory_manager      = None         # 记忆管理器（init_wx_listeners 时创建）
+        self.private_memory_engine = None       # 私聊对象档案记忆引擎（init_wx_listeners 时创建）
         self.all_Mode_listen_list = []           # 全局模式下的动态监听列表，元素格式：[昵称, 最新消息时间戳]
         self.start_time          = datetime.now()
         self.callback_is_die     = False        # 回调函数是否发生致命错误的标志
@@ -1748,7 +1787,14 @@ class WXBot:
         _base       = os.path.dirname(sys.executable) if hasattr(sys, '_MEIPASS') else os.path.abspath(".")
         memory_base = os.path.join(_base, 'memory')
         self.memory_manager = MemoryManager(wx_id, memory_base)
+        self.private_memory_engine = PrivateMemoryEngine(
+            self.config,
+            wx_id,
+            _base,
+            self._get_memory_agent_api,
+        )
         log(message=f"记忆管理器已初始化，微信号: {wx_id}")
+        log(message=f"私聊对象档案记忆引擎已初始化，微信号: {wx_id}")
 
         # 启动 wxautox 消息监听器
         log(message='启动wxautox监听器...')
@@ -2583,6 +2629,15 @@ class WXBot:
                 return self.api_cache[idx]
         return self.api
 
+    def _get_memory_agent_api(self, user_name):
+        """获取私聊对象档案记忆链路使用的接口，未单独配置时跟随私聊回复接口。"""
+        idx = int(getattr(self.config, "memory_agent_api_index", -1))
+        if idx >= 0:
+            if idx not in self.api_cache:
+                self.api_cache[idx] = self._init_api_by_index(idx)
+            return self.api_cache[idx]
+        return self._get_chat_api(user_name)
+
     def _get_chat_prompt(self, user_name):
         """获取私聊用户对应的 prompt 内容（白名单模式查 chat_prompt_map，全局模式用 default_prompt）"""
         if not self.config.AllListen_switch:
@@ -2857,6 +2912,7 @@ class WXBot:
         if self._pause_chat_reply:
             return True
         message_content = message_override if message_override is not None else str(message.content)
+        session_bundle = None
         try:
             is_keyword = False
             # 私聊关键词优先匹配
@@ -2867,17 +2923,27 @@ class WXBot:
                         log(message=f"私聊 {chat.who} 关键字消息：" + message_content)
                         reply = self.config.keyword_dict[keyword]
             if not is_keyword:
-                # 未命中关键词，调用 AI 接口（带入历史记忆）
-                if history_override is not None:
-                    history = history_override
-                else:
-                    history = []
-                if history_override is None and self.config.memory_switch and self.memory_manager:
+                _base_prompt = self._get_chat_prompt(chat.who)
+                history = history_override if history_override is not None else []
+                use_private_memory_v2 = (
+                    self.private_memory_engine is not None
+                    and self.config.private_profile_memory_switch
+                    and getattr(message, "type", "") != "image"
+                    and "+引用的图片:" not in message_content
+                )
+                if use_private_memory_v2:
+                    session_bundle = self.private_memory_engine.prepare(
+                        chat.who,
+                        message_content,
+                        _base_prompt,
+                    )
+                    _base_prompt = session_bundle.effective_prompt or _base_prompt
+                    history = session_bundle.history or []
+                elif history_override is None and self.config.memory_switch and self.memory_manager:
                     history = self.memory_manager.get_messages(
                         chat.who, self.config.memory_context_count
                     )
                 # 构建有效 prompt（拆分开关开启时注入格式要求）
-                _base_prompt = self._get_chat_prompt(chat.who)
                 if self.config.chat_split_reply_switch:
                     _effective_prompt = self._build_split_prompt(
                         _base_prompt,
@@ -2939,6 +3005,12 @@ class WXBot:
                     result = chat.SendMsg(segment)
             else:
                 result = chat.SendMsg(part)
+
+        if session_bundle and self.private_memory_engine:
+            try:
+                self.private_memory_engine.finalize(session_bundle, reply)
+            except Exception as e:
+                log(level="WARNING", message=f"私聊对象档案记忆 finalize 失败: {chat.who} - {e}")
 
         self.msg_replied_count += 1
         return result
@@ -3127,10 +3199,14 @@ class WXBot:
             result = chat.SendMsg("群聊关键词已设为：无论是否@均触发")
         elif content == "/记忆状态":
             sw  = "开启" if self.config.memory_switch else "关闭"
+            v2_sw = "开启" if self.config.private_profile_memory_switch else "关闭"
             result = chat.SendMsg(
                 f"对话记忆：{sw}\n"
                 f"上下文条数：{self.config.memory_context_count} 条\n"
-                f"最大存储：{self.config.memory_max_count} 条"
+                f"最大存储：{self.config.memory_max_count} 条\n"
+                f"私聊对象档案记忆V2：{v2_sw}\n"
+                f"私聊最近轮次：{self.config.memory_recent_turns} 轮\n"
+                f"滚动摘要阈值：{self.config.memory_summary_budget_chars} 字"
             )
         elif content == "/开启记忆":
             self.config.set_config('memory_switch', True)
@@ -3288,6 +3364,11 @@ class WXBot:
         send_msg += "对话记忆：" + ("开启" if self.config.memory_switch else "关闭")
         if self.config.memory_switch:
             send_msg += f"  上下文条数：{self.config.memory_context_count}\n"
+        else:
+            send_msg += "\n"
+        send_msg += "私聊对象档案记忆V2：" + ("开启" if self.config.private_profile_memory_switch else "关闭")
+        if self.config.private_profile_memory_switch:
+            send_msg += f"  最近轮次：{self.config.memory_recent_turns}  摘要阈值：{self.config.memory_summary_budget_chars}\n"
         else:
             send_msg += "\n"
 
@@ -3513,6 +3594,8 @@ class WXBot:
         if not self.memory_manager:
             return chat.SendMsg("记忆功能未初始化")
         self.memory_manager.clear_messages(self.config.cmd)
+        if self.private_memory_engine:
+            self.private_memory_engine.clear_entity(self.config.cmd)
         return chat.SendMsg(f"已清除「{self.config.cmd}」的对话记忆")
 
     def handle_clear_user_memory(self, chat, message):
@@ -3523,6 +3606,8 @@ class WXBot:
         if not self.memory_manager:
             return chat.SendMsg("记忆功能未初始化")
         self.memory_manager.clear_messages(name)
+        if self.private_memory_engine:
+            self.private_memory_engine.clear_entity(name)
         return chat.SendMsg(f"已清除「{name}」的对话记忆")
 
     def handle_clear_all_memory(self, chat, message):
@@ -3530,6 +3615,8 @@ class WXBot:
         if not self.memory_manager:
             return chat.SendMsg("记忆功能未初始化")
         count = self.memory_manager.clear_all_messages()
+        if self.private_memory_engine:
+            self.private_memory_engine.clear_all()
         return chat.SendMsg(f"已清除所有对话记忆（共 {count} 个会话）")
 
     def handle_image_recognition_status(self, chat, message):
@@ -4010,6 +4097,8 @@ class WXBot:
             "keyword_count":         len(self.config.keyword_dict),
             "memory_switch":         self.config.memory_switch,
             "memory_context_count":  self.config.memory_context_count,
+            "private_profile_memory_switch": self.config.private_profile_memory_switch,
+            "memory_recent_turns":   self.config.memory_recent_turns,
             "reply_delay_switch":    self.config.reply_delay_switch,
             "reply_delay_min":       self.config.reply_delay_min,
             "reply_delay_max":       self.config.reply_delay_max,
